@@ -1,0 +1,252 @@
+#!/usr/bin/env python
+#
+# zfs-usage-watch
+#
+# Watch 'used' property on an interval and report file systems
+# exceeding a threshold.
+#
+
+import sys
+import re
+import time
+import subprocess
+import argparse
+import functools
+
+
+def get_zfs_filesystems(patterns):
+    """Return a list of all ZFS file systems whose name matches one or more regular expressions.
+
+    patterns    list of one or more strings that are compiled as a regular expression for matching
+
+May raise an exception as per the subprocess.Popen() function."""
+    regex_list = []
+    datasets = []
+    for pattern in patterns:
+        regex_list.append(re.compile(pattern))
+    cmd = ['zfs', 'list', '-rt', 'filesystem', '-o', 'name']
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdout, stderr) = process.communicate()
+    for fs_name in stdout.split('\n'):
+        for regex in regex_list:
+            m = regex.search(fs_name)
+            if m is not None:
+                datasets.append(fs_name)
+    return datasets
+
+
+def multiplier_for_unit(unit):
+    """Return the floating point multiplier associated with the input unit.  The unit may be either a static byte size or a rate (per a 'ps' suffix).  S.I. and binary units are permissible.
+
+    unit        the string containing the unit
+
+A ValueError exception is raised if the unit string cannot be parsed."""
+    prefix_map = {
+            'k':1e3, 'M':1e6, 'G':1e9, 'T':1e12, 'P':1e15,
+            'K':1024.0, 'Ki':1024.0, 'Mi':1024.0**2, 'Gi':1024.0**3, 'Ti':1024.0**4, 'Pi':1024.0**5
+        }
+    if unit in prefix_map:
+        return prefix_map[unit]
+    m = re.match(r'^(.*)([Bb])([Pp][Ss])?$', unit)
+    if m is not None and (m.group(1) == '' or m.group(1) in prefix_map):
+        v = prefix_map[m.group(1)] if (m.group(1)) else 1
+        if m.group(2) == 'b':
+            v = v / 8.0
+        return v
+    raise ValueError('not a valid unit: ' + unit)
+
+
+def get_zfs_used(datasets):
+    """Returns the number of bytes currently consumed by the ZFS file systems mentioned in the datasets list.
+
+    datasets    list of one or more ZFS file system names
+
+May raise an exception as per the subprocess.Popen() function."""
+    cmd = ['zfs', 'get', '-Hp', 'used']
+    cmd.extend(datasets)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdout, stderr) = process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(stderr.strip())
+    used = dict()
+    for line in stdout.split('\n'):
+        if len(line) > 0:
+            pieces = line.split()
+            used[pieces[0]] = int(pieces[2])
+    return used
+
+
+def human_readable_bytes(bytes, is_binary_form=True):
+    """Returns the given number of bytes in a human-readable form.  Defaults to binary units.
+
+    bytes           number of bytes to convert to human-readable form
+    is_binary_form  boolean determining binary or S.I. units
+
+May raise an exception if bytes is not a numeric type."""
+    if is_binary_form:
+        units = [ 'B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB' ]
+        multiplier = 1024.0
+    else:
+        units = [ 'B', 'kB', 'MB', 'GB', 'TB', 'PB' ]
+        multiplier = 1000.0
+    i = 0
+    while i < len(units) and bytes > multiplier:
+        i = i + 1
+        bytes = bytes / multiplier
+    return '{:.2f} {:s}'.format(bytes, units[i])
+
+
+#
+# Create our CLI argument parser:
+#
+cli_parser = argparse.ArgumentParser()
+cli_parser.add_argument('-v', '--verbose',
+                dest='is_verbose',
+                action='store_true',
+                default=False,
+                help='show additional information during execution')
+cli_parser.add_argument('-m', '--match-regex',
+                dest='should_match_regexes',
+                action='store_true',
+                default=False,
+                help='ZFS file system names are regular expressions to match against the list of all file systems')
+cli_parser.add_argument('-S', '--show-si-units',
+                dest='should_show_si_units',
+                action='store_true',
+                default=False,
+                help='display rate/byte values in S.I. units, not binary')
+cli_parser.add_argument('-T', '--show-timestamp',
+                dest='should_show_timestamp',
+                action='store_true',
+                default=False,
+                help='display a timestamp on each iteration')
+cli_parser.add_argument('-P', '--show-percentage',
+                dest='should_show_percentage',
+                action='store_true',
+                default=False,
+                help='display each filesystem percent of the total')
+cli_parser.add_argument('-i', '--interval',
+                metavar='<seconds>',
+                dest='interval',
+                type=int,
+                default=5,
+                help='number of seconds between checks')
+cli_parser.add_argument('-t', '--threshold',
+                metavar='<rate>',
+                dest='threshold',
+                default='0',
+                help='any rate greater-than this value is displayed; units are permissible (e.g. K, KiBps, kBps, kbps)')
+# Positional arguments (file system names):
+cli_parser.add_argument('datasets',
+                metavar='<fs-name>',
+                nargs='+',
+                help='one or more ZFS file system names')
+
+#
+# Parse all CLI arguments:
+#
+cli_args = cli_parser.parse_args()
+
+#
+# If the positional arguments are regular expressions, find all matching
+# file system names:
+#
+if cli_args.should_match_regexes:
+    cli_args.datasets = get_zfs_filesystems(cli_args.datasets)
+    if len(cli_args.datasets) == 0:
+        sys.exit('ERROR:  no ZFS file systems matching the regular expression(s)')
+if cli_args.is_verbose:
+    print 'INFO: will check file systems: \nINFO:     ' + '\nINFO:     '.join(cli_args.datasets)
+
+#
+# Validate and calculate the threshold:
+#
+try:
+    threshold = float(cli_args.threshold)
+except:
+    m = re.match(r'(\d+(\.\d+)?([Ee]\d+)?)\s*(\S+)\s*$', cli_args.threshold)
+    if m is not None:
+        try:
+            threshold = float(m.group(1)) * multiplier_for_unit(m.group(4))
+        except Exception as E:
+            sys.exit('ERROR:  invalid threshold: ' + str(E))
+    else:
+        sys.exit('ERROR:  invalid threshold: ' + cli_args.threshold)
+if cli_args.is_verbose:
+    print 'INFO: will print rates exceeding {:f} Bps'.format(threshold)
+    print 'INFO: will sleep for {:d} second(s) on each iteration'.format(cli_args.interval)
+
+#
+# Wrap the loop in a try...except block to catch Ctrl-C from the user
+# and NOT show a stack trace et al.
+#
+used = None
+prev_used = None
+try:
+    #
+    # We run forever...
+    #
+    while True:
+        try:
+            #
+            # Show timestamp?
+            #
+            if cli_args.should_show_timestamp:
+                print '{:s}:'.format(time.asctime())
+
+            #
+            # Get current usage for each file system:
+            #
+            used = get_zfs_used(cli_args.datasets)
+            if prev_used:
+                #
+                # Calculate change exceeding threshold:
+                #
+                delta = dict()
+                rate = dict()
+                for (fs, cur_bytes) in used.iteritems():
+                    if fs in prev_used:
+                        delta_bytes = cur_bytes - prev_used[fs]
+                        if delta_bytes > threshold:
+                            delta[fs] = delta_bytes
+                            rate[fs] = float(delta_bytes) / float(cli_args.interval)
+                #
+                # Anything in excess?
+                #
+                if len(rate):
+                    #
+                    # Display each rate and calculate the total:
+                    #
+                    if cli_args.should_show_percentage:
+                        total_bytes_per_second = functools.reduce(lambda a,b : a + b, rate.values())
+                        total_bytes = functools.reduce(lambda a,b : a + b, delta.values())
+                        for (fs, bytes_per_second) in rate.iteritems():
+                            print '  {:<48s} {:>12s}ps {:.2f}% ({:s} {:.2f}%)'.format(fs, human_readable_bytes(bytes_per_second, is_binary_form=(not cli_args.should_show_si_units)), 100.0 * bytes_per_second / total_bytes_per_second, human_readable_bytes(delta[fs], is_binary_form=(not cli_args.should_show_si_units)), 100.0 * delta[fs] / total_bytes)
+
+                    else:
+                        total_bytes_per_second = 0
+                        total_bytes = 0
+                        for (fs, bytes_per_second) in rate.iteritems():
+                            total_bytes_per_second = total_bytes_per_second + bytes_per_second
+                            total_bytes = total_bytes + delta[fs]
+                            print '  {:<48s} {:>12s}ps ({:s})'.format(fs, human_readable_bytes(bytes_per_second, is_binary_form=(not cli_args.should_show_si_units)), human_readable_bytes(delta[fs], is_binary_form=(not cli_args.should_show_si_units)))
+                    #
+                    # Display the total (and an extra blank line if we're not showing
+                    # timestamps, just to keep the events clearly separate):
+                    #
+                    print '  {:<48s} {:>12s}ps ({:s})'.format('', human_readable_bytes(total_bytes_per_second, is_binary_form=(not cli_args.should_show_si_units)), human_readable_bytes(total_bytes, is_binary_form=(not cli_args.should_show_si_units)))
+                    if not cli_args.should_show_timestamp:
+                        print
+            #
+            # Remember this iteration's info and wait for the next iteration:
+            #
+            prev_used = used
+            time.sleep(cli_args.interval)
+        except Exception as E:
+            sys.exit('ERROR:  unable to get ZFS file system usage: {:s}'.format(str(E)))
+
+except:
+    #
+    # Ignore Ctrl-C from the user...
+    pass
+
